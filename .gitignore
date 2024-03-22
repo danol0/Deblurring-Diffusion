@@ -1,0 +1,14 @@
+data/*
+runs*/*
+*.pdf
+*.pyc
+*.pth
+*.ipynb
+wandb/*
+*.png
+*.pt
+*.npy
+*.DS_Store
+*.txt
+!src/conditional.png
+!src/latent.png
