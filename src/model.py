@@ -8,7 +8,7 @@ from typing import Tuple
 
 
 def blur_schedules(n_T: int, scheduler: str = "linear", beta1: float = 1e-4, beta2: float = 0.02) -> list:
-    """Generate the standard deviation schedule for the blur kernel, parameterized by beta1 and beta2."""
+    """Generate the standard deviation schedule for the blur kernel."""
     if scheduler == "constant":
         return [1 + beta2] * n_T
     elif scheduler == "linear":
@@ -37,12 +37,12 @@ class DeblurringDiffusion(nn.Module):
 
         if deg == "blur":
             self.deg = self.iterative_blur
-            self.shades = (-0.8, -0.2)
+            self.shades = (-0.85, -0.65)
         elif deg == "blurfade":
             self.deg = self.blur_and_fade
-            if n_T > 100:
-                print("Warning: Consider changing the beta_t schedule")
             # Pre-computed beta_t for a 100 step diffusion
+            if n_T != 100:
+                print("Consider changing the beta_t schedule")
             # TODO: allow this to be parameterized
             t = torch.linspace(0, 1, n_T)
             self.register_buffer("beta_t", 1e-3 * (0.2 / 1e-3) ** t)
@@ -55,13 +55,10 @@ class DeblurringDiffusion(nn.Module):
     def iterative_blur(
         self,
         x: torch.Tensor,
-        t: int | torch.Tensor,
+        t: int,
         start: int = 0,
         col: torch.Tensor = None,  # Dummy argument for compatibility
     ) -> torch.Tensor:
-        # t is a tensor when called from forward and int when called from sample
-        if type(t) is not int:
-            t = int(t[0].item())
         for i in range(start, t):
             x = tvF.gaussian_blur(x, 7, self.stds[i])
         return x
@@ -69,12 +66,10 @@ class DeblurringDiffusion(nn.Module):
     def blur_and_fade(
         self,
         x: torch.Tensor,
-        t: int | torch.Tensor,
+        t: int,
         start: int = 0,
         col: torch.Tensor = None,
     ) -> torch.Tensor:
-        if type(t) is not int:
-            t = int(t[0].item())
         col = (
             torch.rand(x.shape[0], 1, 1, 1, device=x.device) * 2 - 1
             if col is None
@@ -87,10 +82,11 @@ class DeblurringDiffusion(nn.Module):
         return x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+
         # Single time step each time - easier to parallelize
         t = torch.randint(1, self.n_T + 1, (1,), device=x.device).expand(x.shape[0])
 
-        z_t = self.deg(x, t)
+        z_t = self.deg(x, int(t[0].item()))
 
         # Predict the original image
         return self.criterion(x, self.net(z_t, t / self.n_T))
@@ -115,7 +111,7 @@ class DeblurringDiffusion(nn.Module):
         skip: Highest t step to re-blur to
         naive: Use algorithm 1 in Bansal
         show_steps: Number of intermediate steps to show
-        shades: Upper and lower bounds for shade of z_T
+        shades: Lower and upper bounds for shade of z_T
         """
 
         # Sample z_T
