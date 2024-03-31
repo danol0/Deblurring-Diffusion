@@ -7,7 +7,7 @@ import wandb
 import numpy as np
 import os
 
-from options import parse_args
+from src.options import parse_args
 from src.utils import define_model, save_model, mkdir, sample_grid, get_transforms
 
 

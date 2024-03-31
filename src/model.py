@@ -7,14 +7,26 @@ from typing import Tuple
 # --- Diffusion ---
 
 
-def blur_schedules(n_T: int, scheduler: str = "linear", beta1: float = 1e-4, beta2: float = 0.02) -> list:
-    """Generate the standard deviation schedule for the blur kernel."""
+def blur_schedules(
+    n_T: int, scheduler: str = "linear", beta1: float = 1e-4, betaT: float = 0.02
+) -> list:
+    """Generate the standard deviation schedule for the blur kernel.
+
+    Args:
+        n_T: Number of diffusion steps.
+        scheduler: Type of scheduler to use, either "constant", "linear" or "exp".
+        beta1, betaT: Parameters that define schedules.
+
+    Returns:
+        List of standard deviations for each time step.
+    """
+
     if scheduler == "constant":
-        return [1 + beta2] * n_T
+        return [1 + betaT] * n_T
     elif scheduler == "linear":
-        return [(beta2) * t + beta1 for t in range(n_T)]
+        return [(betaT) * t + beta1 for t in range(n_T)]
     elif scheduler == "exp":
-        # TODO: allow this to be parameterized
+        # Currently cannot be parameterized for ease of use
         return [0.5 * np.exp(0.03 * t) for t in range(n_T)]
     else:
         raise ValueError(f"Unknown scheduler: {scheduler}")
@@ -29,6 +41,16 @@ class DeblurringDiffusion(nn.Module):
         scheduler: str = "linear",
         deg: str = "blur",
     ) -> None:
+        """
+        Diffusion model that inverts Gaussian blurs.
+
+        Args:
+            net: Deep learning model used to predict the original image.
+            n_T: Number of diffusion steps.
+            criterion: Loss function to use for training.
+            scheduler: Schedule for the standard deviation of the blur kernel.
+            deg: Type of degradation to use, either "blur" or "blurfade".
+        """
         super().__init__()
 
         self.net = net
@@ -59,6 +81,17 @@ class DeblurringDiffusion(nn.Module):
         start: int = 0,
         col: torch.Tensor = None,  # Dummy argument for compatibility
     ) -> torch.Tensor:
+        """Iteratively blur a batch of images.
+
+        Args:
+            x: Batch of images to blur.
+            t: Time step to blur to.
+            start: Time step to start from.
+            col: Dummy argument for compatibility, ignored.
+
+        Returns:
+            Degraded batch of images.
+        """
         for i in range(start, t):
             x = tvF.gaussian_blur(x, 7, self.stds[i])
         return x
@@ -70,11 +103,19 @@ class DeblurringDiffusion(nn.Module):
         start: int = 0,
         col: torch.Tensor = None,
     ) -> torch.Tensor:
-        col = (
-            torch.rand(x.shape[0], 1, 1, 1, device=x.device) * 2 - 1
-            if col is None
-            else col
-        )
+        """Iteratively fade and blur a batch of images.
+
+        Args:
+            x: Batch of images to blur.
+            t: Time step to degrade to.
+            start: Time step to start from.
+            col: Colour to fade to, if None a random colour is chosen.
+
+        Returns:
+            Degraded batch of images.
+        """
+        if col is None:
+            col = torch.rand(x.shape[0], 1, 1, 1, device=x.device) * 2 - 1
         for i in range(start, t):
             beta_t = self.beta_t[i, None, None, None].to(x.device)
             x = torch.sqrt(beta_t) * col + torch.sqrt(1 - beta_t) * x
@@ -82,11 +123,12 @@ class DeblurringDiffusion(nn.Module):
         return x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Training step for the model."""
 
         # Single time step each time - easier to parallelize
         t = torch.randint(1, self.n_T + 1, (1,), device=x.device).expand(x.shape[0])
 
-        z_t = self.deg(x, int(t[0].item()))
+        z_t = self.deg(x, t[0].item())
 
         # Predict the original image
         return self.criterion(x, self.net(z_t, t / self.n_T))
@@ -101,42 +143,51 @@ class DeblurringDiffusion(nn.Module):
         skip: int = None,
         naive: bool = False,
         show_steps: int = None,
+        z_T: torch.Tensor = None,
         shades: Tuple = None,
     ) -> torch.Tensor:
         """Algorithms 1 (naive) & 2 (default) in Bansal et al. 2022
 
-        n_sample: Number of samples to generate
-        size: Image size (e.g. (3, 32, 32))
-        std: Standard deviation of the noise added to z_T
-        skip: Highest t step to re-blur to
-        naive: Use algorithm 1 in Bansal
-        show_steps: Number of intermediate steps to show
-        shades: Lower and upper bounds for shade of z_T
-        """
+        Args:
+            n_sample: Number of samples to generate
+            size: Image size (e.g. (1, 32, 32))
+            std: Standard deviation of the noise added to z_T
+            skip: Highest t step to re-blur to, if None the full diffusion is run
+            naive: Use algorithm 1 in Bansal
+            show_steps: Number of intermediate steps to show, if None only the z_0 is returned
+            z_T: Optional precomputed z_T to start from, if None a random z_T is generated
+            shades: Lower and upper bounds for shade of z_T, if None the defaults for the deg type are used
 
-        # Sample z_T
-        shades = self.shades if shades is None else sorted(shades)
-        lower, upper = shades
-        shade = torch.rand(n_sample, 1, 1, 1, device=device)
-        shade = (upper - lower) * shade + lower
-        z_t = torch.randn(n_sample, *size, device=device) * std
-        z_t += shade
+        Returns:
+            Batch of generated samples, including intermediate steps if requested
+        """
+        # Define z_T
+        lower, upper = self.shades if shades is None else sorted(shades)
+        if z_T is not None:
+            assert z_T.shape[0] == n_sample, "z_T must have the same batch size"
+            assert z_T.shape[1:] == size, "z_T must have the same shape as size"
+            z_t = z_T.to(device)
+        else:
+            shade = lower + (upper - lower) * torch.rand(
+                n_sample, 1, 1, 1, device=device
+            )
+            z_t = shade + torch.randn(n_sample, *size, device=device) * std
 
         _one = torch.ones(n_sample, device=device)
 
         # Handle showing steps and skipping
         t_start = skip if skip else self.n_T
-        cuts = None
+        _cuts = None
         if show_steps:
-            cuts = np.linspace(0, t_start, show_steps, dtype=int)[1:-1]
+            _cuts = np.linspace(0, t_start, show_steps, dtype=int)[1:-1]
             steps = z_t.clone()
 
-        if skip:  # Do first step outside loop
+        if skip:  # Do first step outside loop if skipping
             z_0 = self.net(z_t, _one)
-            z_t = self.deg(z_0, t_start, col=shade)
+            z_t = self.deg(z_0, t_start)
             if show_steps:
                 steps = torch.cat((steps, z_t.clone()), dim=0)
-                cuts = cuts[:-1]
+                _cuts = _cuts[:-1]
 
         # Sampling loop
         for t in range(t_start, 0, -1):
@@ -144,12 +195,16 @@ class DeblurringDiffusion(nn.Module):
 
             if t > 1:
                 if naive:
-                    z_t = self.deg(z_0, t - 1, col=shade)
+                    z_t = self.deg(z_0, t - 1)
                 else:
+                    # Make sure the shade is the same for both degradation steps
+                    shade = lower + (upper - lower) * torch.rand(
+                        n_sample, 1, 1, 1, device=device
+                    )
                     z_t_sub_1 = self.deg(z_0, t - 1, col=shade)
                     z_t += -self.deg(z_t_sub_1, t, start=t - 1, col=shade) + z_t_sub_1
 
-            if show_steps and t in cuts:
+            if show_steps and t in _cuts:
                 steps = torch.cat((steps, z_t.clone()), dim=0)
 
         if show_steps:
@@ -161,9 +216,19 @@ class DeblurringDiffusion(nn.Module):
     def encode_decode(
         self, x: torch.Tensor, t: int, device: torch.device, show_steps: int = 3
     ) -> torch.Tensor:
-        """Conditional sampling with intermediate steps."""
+        """Conditional sampling with intermediate steps.
 
-        cuts = np.linspace(0, t, show_steps, dtype=int)[1:]
+        Args:
+            x: Batch of images to encode and decode.
+            t: Max time step to decode to.
+            device: Device to run on.
+            show_steps: Number of intermediate steps to show.
+
+        Returns:
+            Batched tensor of images and intermediate steps.
+        """
+
+        _cuts = np.linspace(0, t, show_steps, dtype=int)[1:]
         x = x.to(device)
         x = x.unsqueeze(0) if len(x.shape) == 3 else x
         steps = x.clone()
@@ -173,7 +238,7 @@ class DeblurringDiffusion(nn.Module):
 
         for i in range(1, t):
             x = self.deg(x, i, start=i - 1, col=col)
-            if i in cuts:
+            if i in _cuts:
                 steps = torch.cat((steps, x.clone()), dim=0)
 
         for i in range(t, 0, -1):
@@ -185,7 +250,7 @@ class DeblurringDiffusion(nn.Module):
             else:
                 x = z_0
 
-            if i in cuts:
+            if i in _cuts:
                 steps = torch.cat((steps, x.clone()), dim=0)
 
         steps = torch.cat((steps, x.clone()), dim=0)
@@ -196,7 +261,21 @@ class DeblurringDiffusion(nn.Module):
 
 
 class UNet(nn.Module):
-    def __init__(self, in_channels: int = 1, dim1: int = 32, time_embeddings: int = 16, act: nn.Module = nn.GELU):
+    def __init__(
+        self,
+        in_channels: int = 1,
+        dim1: int = 32,
+        time_embeddings: int = 16,
+        act: nn.Module = nn.GELU,
+    ):
+        """Simple UNet model.
+
+        Args:
+            in_channels: Number of input channels.
+            dim1: Number of channels in the first convolutional layer.
+            time_embeddings: Number of time embeddings to use.
+            act: Activation function to use."""
+
         super().__init__()
 
         # Encoder
@@ -263,7 +342,13 @@ class UNet(nn.Module):
             in_channels, out_channels, kernel_size, stride, padding, output_padding
         )
 
-    def maxpool(self, dropout_rate: float = 0.5, kernel_size: int = 2, stride: int = 2, padding: int = 0) -> nn.Module:
+    def maxpool(
+        self,
+        dropout_rate: float = 0.5,
+        kernel_size: int = 2,
+        stride: int = 2,
+        padding: int = 0,
+    ) -> nn.Module:
         return nn.Sequential(
             nn.MaxPool2d(kernel_size, stride, padding), nn.Dropout2d(dropout_rate)
         )
@@ -289,6 +374,43 @@ class UNet(nn.Module):
         out = self.final(out)
 
         return out
+
+
+class ConvNextBlock(nn.Module):
+    """Source: Cold Diffusion / https://arxiv.org/pdf/2201.03545.pdf"""
+
+    def __init__(
+        self,
+        dim: int,
+        dim_out: int,
+        *,
+        time_dim: int = 32,
+        mult: int = 2,
+        norm: bool = True,
+        expected_shape: Tuple = (28, 28),
+    ) -> None:
+        super().__init__()
+
+        self.time_mlp = nn.Sequential(nn.GELU(), nn.Linear(time_dim, dim))
+
+        self.depthwise = nn.Conv2d(dim, dim, 7, padding=3, groups=dim)
+
+        self.net = nn.Sequential(
+            nn.LayerNorm((dim, *expected_shape)) if norm else nn.Identity(),
+            nn.Conv2d(dim, dim_out * mult, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(dim_out * mult, dim_out, 3, padding=1),
+        )
+
+        self.residual = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        h = self.depthwise(x)
+        # Add time embedding
+        t_emb = self.time_mlp(t)
+        h += t_emb.unsqueeze(-1).unsqueeze(-1)
+        h = self.net(h)
+        return h + self.residual(x)
 
 
 class CNNBlock(nn.Module):
@@ -383,39 +505,3 @@ class CNN(nn.Module):
             embed = block(embed)
 
         return embed
-
-
-class ConvNextBlock(nn.Module):
-    """Source: Cold Diffusion / https://arxiv.org/pdf/2201.03545.pdf"""
-
-    def __init__(
-        self,
-        dim: int,
-        dim_out: int,
-        *,
-        time_dim: int = 32,
-        mult: int = 2,
-        norm: bool = True,
-        expected_shape: Tuple = (28, 28)
-    ) -> None:
-        super().__init__()
-
-        self.time_mlp = nn.Sequential(nn.GELU(), nn.Linear(time_dim, dim))
-
-        self.depthwise = nn.Conv2d(dim, dim, 7, padding=3, groups=dim)
-
-        self.net = nn.Sequential(
-            nn.LayerNorm((dim, *expected_shape)) if norm else nn.Identity(),
-            nn.Conv2d(dim, dim_out * mult, 3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(dim_out * mult, dim_out, 3, padding=1),
-        )
-
-        self.residual = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
-
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        h = self.depthwise(x)
-        t_emb = self.time_mlp(t)
-        h += t_emb.unsqueeze(-1).unsqueeze(-1)
-        h = self.net(h)
-        return h + self.residual(x)
